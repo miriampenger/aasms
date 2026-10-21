@@ -134,8 +134,11 @@ export async function PATCH(
       } catch (e) {
         // Ignore invalid year
       }
-      delete dataToUpdate.year;
     }
+    // Source has no `year` column. The metadata editor always sends `year`, as "" for
+    // sources with a full date or no date; Prisma rejects the unknown field and the
+    // whole update fails, so drop it in every case.
+    delete dataToUpdate.year;
 
     // When metadataChosen is provided and status not explicitly set, move to READY_FOR_ANALYSIS
     if (validation.data.metadataChosen !== undefined && validation.data.status === undefined) {
