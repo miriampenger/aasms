@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     # Analysis settings
     max_tokens: int = 8000
     temperature: float = 0.1
+    # Multi-LLM screening: when true, each provider evaluates all criteria of a source in
+    # one call, so the document is sent once per provider instead of once per criterion.
+    # Off by default until its decisions have been compared with per-criterion screening.
+    screening_batch_criteria: bool = False
 
     # Open-access PDF retrieval
     # Unpaywall requires a contact email; OpenAlex uses it for its polite pool.

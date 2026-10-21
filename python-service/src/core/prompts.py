@@ -350,6 +350,64 @@ Respond ONLY with JSON:
 """
 
 
+def build_all_criteria_prompt(
+    inclusion_criteria: list[str],
+    exclusion_criteria: list[str],
+    source_content: dict,
+    research_questions: list,
+) -> str:
+    """Create one prompt that evaluates every inclusion and exclusion criterion.
+
+    The document is embedded once instead of once per criterion. Each criterion gets an
+    id (I1, I2, ... for inclusion, E1, E2, ... for exclusion), and replies are matched
+    by that id rather than by the model copying the criterion text back exactly.
+    """
+    rq_text = format_research_questions(research_questions)
+    doc_context = format_document_context(source_content)
+
+    sections = []
+    if inclusion_criteria:
+        lines = "\n".join(f"I{i}. {c}" for i, c in enumerate(inclusion_criteria, start=1))
+        sections.append(
+            "Inclusion criteria (decision=true: the document satisfies the criterion):\n" + lines
+        )
+    if exclusion_criteria:
+        lines = "\n".join(f"E{i}. {c}" for i, c in enumerate(exclusion_criteria, start=1))
+        sections.append(
+            "Exclusion criteria (decision=true: the document meets the criterion, "
+            "which excludes it):\n" + lines
+        )
+    criteria_block = "\n\n".join(sections)
+    total = len(inclusion_criteria) + len(exclusion_criteria)
+
+    return f"""
+You are assessing a research document for a systematic mapping study.
+
+Research Questions:
+{rq_text}
+
+Document:
+{doc_context}
+
+{criteria_block}
+
+Task:
+Evaluate each of the {total} criteria on its own. For each one, write the reasoning
+first and give the decision after it.
+Respond ONLY with JSON containing exactly {total} evaluations, one per criterion id:
+{{
+  "evaluations": [
+    {{
+      "id": "I1",
+      "reasoning": "brief justification grounded in the text",
+      "decision": true or false,
+      "confidence": 0.0-1.0
+    }}
+  ]
+}}
+"""
+
+
 def build_classification_prompt(
     source_content: dict,
     classification_schema: dict,

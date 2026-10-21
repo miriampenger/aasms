@@ -221,6 +221,51 @@ async def test_voting_mode_exclusion_overrides(fake_provider_factory):
     assert result["recommendation"] is False
 
 
+@pytest.mark.asyncio
+async def test_voting_mode_batched_makes_one_call_per_provider(fake_provider_factory):
+    providers = [fake_provider_factory(decision=True) for _ in range(3)]
+    voting = MultiLLMVotingService(providers)
+    service = InclusionEvaluationService(
+        voting_service=voting, use_voting=True, batch_criteria=True
+    )
+
+    result = await service.evaluate_inclusion(
+        source_content={"title": "Test", "abstract": "Something"},
+        inclusion_criteria=["C1", {"criterion": "C2"}],
+        exclusion_criteria=["E1"],
+    )
+
+    assert [p.call_count for p in providers] == [1, 1, 1]
+    assert [c["criterion"] for c in result["inclusion_criteria"]] == ["C1", "C2"]
+    assert [c["criterion"] for c in result["exclusion_criteria"]] == ["E1"]
+    assert result["inclusion_criteria"][0]["voting_details"]["total_voters"] == 3
+    # Inclusion met, but the exclusion criterion applies as well -> exclude
+    assert result["recommendation"] is False
+    assert result["voting_summary"]["unanimous_decisions"] == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setting, calls_per_provider", [(False, 3), (True, 1)])
+async def test_voting_mode_follows_the_screening_batch_criteria_setting(
+    fake_provider_factory, monkeypatch, setting, calls_per_provider
+):
+    from src.services import inclusion_evaluation_service as module
+
+    monkeypatch.setattr(module.settings, "screening_batch_criteria", setting)
+    providers = [fake_provider_factory(decision=True) for _ in range(3)]
+    voting = MultiLLMVotingService(providers)
+    service = InclusionEvaluationService(voting_service=voting, use_voting=True)
+
+    await service.evaluate_inclusion(
+        source_content={"title": "Test", "abstract": "Something"},
+        inclusion_criteria=["C1", "C2"],
+        exclusion_criteria=["E1"],
+    )
+
+    assert service.batch_criteria is setting
+    assert [p.call_count for p in providers] == [calls_per_provider] * 3
+
+
 # --- Confidence Aggregation ---
 
 

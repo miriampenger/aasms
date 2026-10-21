@@ -1,6 +1,11 @@
 """Fake LLM provider for E2E testing without real API keys."""
 
+import re
+
 from src.core.llm_provider import LLMProvider
+
+# Criterion lines of the batched screening prompt: "I1. ...", "E2. ..."
+_CRITERION_ID_LINE = re.compile(r"^([IE]\d+)\. ", re.MULTILINE)
 
 
 class FakeProvider(LLMProvider):
@@ -57,6 +62,22 @@ class FakeProvider(LLMProvider):
         is_rq_summary = isinstance(response_schema, dict) and (
             "summary" in response_schema and "key_findings" in response_schema
         )
+
+        is_batch_screening = isinstance(response_schema, dict) and "evaluations" in response_schema
+
+        if is_batch_screening:
+            # One evaluation per criterion id listed in the batched screening prompt
+            return {
+                "evaluations": [
+                    {
+                        "id": criterion_id,
+                        "reasoning": self.reasoning,
+                        "decision": self.decision,
+                        "confidence": self.confidence,
+                    }
+                    for criterion_id in _CRITERION_ID_LINE.findall(prompt or "")
+                ]
+            }
 
         if is_rq_summary:
             return {

@@ -10,6 +10,7 @@ import statistics
 import time
 from typing import Any
 
+from src.core.config import settings
 from src.core.context_cache import initialize_context, normalize_criteria
 from src.core.llm_provider import LLMProvider, get_voting_providers, voting_available
 from src.core.prompts import build_per_criterion_prompt
@@ -36,6 +37,7 @@ class InclusionEvaluationService:
         llm_provider: LLMProvider | None = None,
         voting_service: MultiLLMVotingService | None = None,
         use_voting: bool | None = None,
+        batch_criteria: bool | None = None,
     ):
         """Initialize the evaluation service.
 
@@ -43,9 +45,14 @@ class InclusionEvaluationService:
             llm_provider: Single LLM provider for non-voting mode
             voting_service: Pre-configured voting service (optional)
             use_voting: Force voting on/off. If None, auto-detect based on available providers.
+            batch_criteria: In voting mode, evaluate all criteria in one call per provider.
+                If None, follow the SCREENING_BATCH_CRITERIA setting.
         """
         self.llm_provider = llm_provider
         self.voting_service = voting_service
+        self.batch_criteria = (
+            settings.screening_batch_criteria if batch_criteria is None else batch_criteria
+        )
 
         # Auto-detect voting mode if not explicitly set
         if use_voting is None:
@@ -196,6 +203,7 @@ class InclusionEvaluationService:
             "inclusion_evaluation: starting VOTING evaluation",
             extra={
                 "mode": "voting",
+                "batched": self.batch_criteria,
                 "providers": self.voting_service.provider_names,
                 "inclusion_criteria_count": len(inclusion_list),
                 "exclusion_criteria_count": len(exclusion_list),
@@ -204,45 +212,21 @@ class InclusionEvaluationService:
             },
         )
 
-        # Response schema for criterion evaluation.
-        # Field order is deliberate: reasoning precedes decision so the model
-        # commits to the boolean AFTER writing its analysis (structured output
-        # generates fields in schema order; see _to_gemini_schema).
-        response_schema = {
-            "criterion": "string",
-            "reasoning": "string",
-            "decision": "boolean",
-            "confidence": "number",
-        }
-
-        # Create voting tasks for all criteria
-        inclusion_tasks = []
-        for criterion in inclusion_list:
-            prompt = build_per_criterion_prompt(
-                criterion=criterion,
+        if self.batch_criteria:
+            # One call per provider covering every criterion (see vote_on_all_criteria).
+            inclusion_votes, exclusion_votes = await self.voting_service.vote_on_all_criteria(
+                inclusion_criteria=inclusion_list,
+                exclusion_criteria=exclusion_list,
                 source_content=source_content,
                 research_questions=research_questions,
-                inclusion=True,
             )
-            inclusion_tasks.append(
-                self.voting_service.vote_on_criterion(prompt, criterion, response_schema)
-            )
-
-        exclusion_tasks = []
-        for criterion in exclusion_list:
-            prompt = build_per_criterion_prompt(
-                criterion=criterion,
+        else:
+            inclusion_votes, exclusion_votes = await self._vote_per_criterion(
                 source_content=source_content,
+                inclusion_list=inclusion_list,
+                exclusion_list=exclusion_list,
                 research_questions=research_questions,
-                inclusion=False,
             )
-            exclusion_tasks.append(
-                self.voting_service.vote_on_criterion(prompt, criterion, response_schema)
-            )
-
-        # Execute all voting in parallel
-        inclusion_votes: list[AggregatedVote] = await asyncio.gather(*inclusion_tasks)
-        exclusion_votes: list[AggregatedVote] = await asyncio.gather(*exclusion_tasks)
 
         # Convert to result format with voting details
         inclusion_results = []
@@ -342,6 +326,55 @@ class InclusionEvaluationService:
             "voting_enabled": True,
             "voting_summary": voting_summary.to_dict(),
         }
+
+    async def _vote_per_criterion(
+        self,
+        source_content: dict[str, Any],
+        inclusion_list: list[str],
+        exclusion_list: list[str],
+        research_questions: list[str],
+    ) -> tuple[list[AggregatedVote], list[AggregatedVote]]:
+        """Vote on each criterion with its own prompt (one call per criterion and provider)."""
+        # Response schema for criterion evaluation.
+        # Field order is deliberate: reasoning precedes decision so the model
+        # commits to the boolean AFTER writing its analysis (structured output
+        # generates fields in schema order; see _to_gemini_schema).
+        response_schema = {
+            "criterion": "string",
+            "reasoning": "string",
+            "decision": "boolean",
+            "confidence": "number",
+        }
+
+        # Create voting tasks for all criteria
+        inclusion_tasks = []
+        for criterion in inclusion_list:
+            prompt = build_per_criterion_prompt(
+                criterion=criterion,
+                source_content=source_content,
+                research_questions=research_questions,
+                inclusion=True,
+            )
+            inclusion_tasks.append(
+                self.voting_service.vote_on_criterion(prompt, criterion, response_schema)
+            )
+
+        exclusion_tasks = []
+        for criterion in exclusion_list:
+            prompt = build_per_criterion_prompt(
+                criterion=criterion,
+                source_content=source_content,
+                research_questions=research_questions,
+                inclusion=False,
+            )
+            exclusion_tasks.append(
+                self.voting_service.vote_on_criterion(prompt, criterion, response_schema)
+            )
+
+        # Execute all voting in parallel
+        inclusion_votes: list[AggregatedVote] = await asyncio.gather(*inclusion_tasks)
+        exclusion_votes: list[AggregatedVote] = await asyncio.gather(*exclusion_tasks)
+        return inclusion_votes, exclusion_votes
 
     async def _evaluate_single_llm(
         self,

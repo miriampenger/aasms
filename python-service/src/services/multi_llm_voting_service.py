@@ -13,6 +13,7 @@ from statistics import mean
 from typing import Any
 
 from src.core.llm_provider import LLMProvider
+from src.core.prompts import build_all_criteria_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,169 @@ class MultiLLMVotingService:
         ]
 
         votes: list[VoteResult] = await asyncio.gather(*tasks)
+        return self._aggregate(criterion, votes)
 
+    async def vote_on_all_criteria(
+        self,
+        inclusion_criteria: list[str],
+        exclusion_criteria: list[str],
+        source_content: dict[str, Any],
+        research_questions: list[str],
+    ) -> tuple[list[AggregatedVote], list[AggregatedVote]]:
+        """Have every provider evaluate all criteria of a source in one call.
+
+        The per-criterion path sends the document once per criterion and provider; this
+        sends it once per provider (13 criteria and 3 providers: 3 calls instead of 39).
+        Majority rule, the two-valid-votes minimum and the handling of failed votes are
+        the same as in vote_on_criterion. One difference: a provider whose reply fails
+        (an error, or a reply cut off at max_tokens) fails on every criterion at once.
+
+        Returns:
+            (inclusion_votes, exclusion_votes), one AggregatedVote per criterion, in the
+            order the criteria were given.
+        """
+        criteria = list(inclusion_criteria) + list(exclusion_criteria)
+        if not criteria:
+            return [], []
+
+        criterion_ids = [f"I{i}" for i in range(1, len(inclusion_criteria) + 1)] + [
+            f"E{i}" for i in range(1, len(exclusion_criteria) + 1)
+        ]
+        prompt = build_all_criteria_prompt(
+            inclusion_criteria=list(inclusion_criteria),
+            exclusion_criteria=list(exclusion_criteria),
+            source_content=source_content,
+            research_questions=research_questions,
+        )
+        # Reasoning precedes decision, as in the per-criterion schema, so the model
+        # writes its analysis before it commits to the boolean.
+        response_schema = {
+            "evaluations": [
+                {
+                    "id": "string",
+                    "reasoning": "string",
+                    "decision": "boolean",
+                    "confidence": "number",
+                }
+            ]
+        }
+        # Generous on purpose: OpenAI reasoning tokens and Gemini thinking tokens count
+        # against this cap, and a reply cut off by it fails this provider on every
+        # criterion at once. (Each per-criterion call gets the provider default, 4000.)
+        max_tokens = 4000 + 500 * len(criteria)
+
+        replies = await asyncio.gather(
+            *[
+                self._get_batch_reply(
+                    provider, name, prompt, response_schema, max_tokens, criterion_ids
+                )
+                for provider, name in zip(self.providers, self.provider_names, strict=True)
+            ]
+        )
+
+        aggregated = []
+        for criterion_id, criterion in zip(criterion_ids, criteria, strict=True):
+            votes = [
+                self._vote_from_evaluation(name, evaluations.get(criterion_id), error)
+                for name, (evaluations, error) in zip(self.provider_names, replies, strict=True)
+            ]
+            aggregated.append(self._aggregate(criterion, votes))
+
+        split = len(inclusion_criteria)
+        return aggregated[:split], aggregated[split:]
+
+    async def _get_batch_reply(
+        self,
+        provider: LLMProvider,
+        provider_name: str,
+        prompt: str,
+        response_schema: dict[str, Any],
+        max_tokens: int,
+        criterion_ids: list[str],
+    ) -> tuple[dict[str, dict[str, Any]], str | None]:
+        """Call one provider for all criteria; return its evaluations keyed by criterion id.
+
+        A failed call, or a reply without an "evaluations" list, returns an error message
+        instead, which becomes a failed vote on every criterion for this provider.
+        """
+        try:
+            result = await provider.generate_structured_output(
+                prompt=prompt,
+                response_schema=response_schema,
+                max_tokens=max_tokens,
+            )
+        except Exception as e:
+            logger.error(f"Batch vote failed for {provider_name}: {e}")
+            return {}, str(e)
+
+        evaluations = result.get("evaluations") if isinstance(result, dict) else None
+        if not isinstance(evaluations, list):
+            message = f"malformed structured output, no 'evaluations' list: {str(result)[:200]}"
+            logger.error(f"Batch vote failed for {provider_name}: {message}")
+            return {}, message
+        return self._index_evaluations(evaluations, criterion_ids), None
+
+    @staticmethod
+    def _index_evaluations(
+        evaluations: list[Any], criterion_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Key a reply's evaluations by criterion id.
+
+        Matching never guesses: an evaluation without a known id is ignored, an id that
+        appears more than once is ambiguous and ignored as well, and every criterion
+        left without an evaluation gets a failed vote.
+        """
+        wanted = set(criterion_ids)
+        by_id: dict[str, dict[str, Any]] = {}
+        duplicates: set[str] = set()
+        for item in evaluations:
+            if not isinstance(item, dict):
+                continue
+            criterion_id = str(item.get("id", "")).strip().rstrip(".").upper()
+            if criterion_id not in wanted:
+                continue
+            if criterion_id in by_id:
+                duplicates.add(criterion_id)
+            by_id[criterion_id] = item
+        for criterion_id in duplicates:
+            del by_id[criterion_id]
+        return by_id
+
+    @staticmethod
+    def _vote_from_evaluation(
+        provider_name: str, evaluation: dict[str, Any] | None, error: str | None
+    ) -> VoteResult:
+        """Turn one provider's evaluation of one criterion into a vote.
+
+        Same rules as _get_single_vote: an evaluation without a boolean decision, or with
+        a confidence that is not a number, is a failed vote, never a silent decision=False.
+        """
+        confidence = 0.0
+        if error is None and evaluation is None:
+            error = "no evaluation for this criterion in the reply"
+        elif error is None and not isinstance(evaluation.get("decision"), bool):
+            error = f"malformed evaluation, no boolean 'decision': {str(evaluation)[:200]}"
+        elif error is None:
+            try:
+                confidence = float(evaluation.get("confidence", 0.5))
+            except (TypeError, ValueError):
+                error = f"malformed evaluation, non-numeric 'confidence': {str(evaluation)[:200]}"
+
+        if error is not None:
+            return VoteResult(
+                provider=provider_name, decision=False, confidence=0.0, reasoning="", error=error
+            )
+
+        return VoteResult(
+            provider=provider_name,
+            decision=evaluation["decision"],
+            confidence=confidence,
+            reasoning=str(evaluation.get("reasoning") or ""),
+            error=None,
+        )
+
+    def _aggregate(self, criterion: str, votes: list[VoteResult]) -> AggregatedVote:
+        """Majority vote over one criterion's votes; failed votes do not count."""
         # Filter out failed votes (but keep track of them)
         valid_votes = [v for v in votes if v.error is None]
         failed_votes = [v for v in votes if v.error is not None]
