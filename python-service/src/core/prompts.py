@@ -339,12 +339,13 @@ Document:
 
 Task:
 Decide whether the document satisfies this {criterion_type.lower()} criterion.
+Write the reasoning first and give the decision after it.
 Respond ONLY with JSON:
 {{
   "criterion": "{criterion}",
+  "reasoning": "brief justification grounded in the text",
   "decision": true or false,
-  "confidence": 0.0-1.0,
-  "reasoning": "brief justification grounded in the text"
+  "confidence": 0.0-1.0
 }}
 """
 
