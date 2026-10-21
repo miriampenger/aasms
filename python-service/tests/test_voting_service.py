@@ -235,6 +235,24 @@ async def test_empty_reply_does_not_fake_a_conflicted_vote(fake_provider_factory
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["false", "true", None, 1])
+async def test_non_boolean_decision_is_a_failed_vote(fake_provider_factory, decision):
+    """bool("false") is True and bool(None) is False: neither may count as a vote."""
+    odd = fake_provider_factory()
+    odd.set_responses([{"decision": decision, "confidence": 0.9, "reasoning": "x"}])
+    service = MultiLLMVotingService([fake_provider_factory(), fake_provider_factory(), odd])
+
+    result = await service.vote_on_criterion(
+        prompt="test", criterion="C1", response_schema={"decision": "boolean"}
+    )
+
+    failed = [v for v in result.individual_votes if v.error]
+    assert len(failed) == 1
+    assert "boolean 'decision'" in failed[0].error
+    assert result.vote_count == 2
+
+
+@pytest.mark.asyncio
 async def test_insufficient_valid_votes(fake_provider_factory):
     """If too many providers fail, returns failed result."""
     failing1 = fake_provider_factory()

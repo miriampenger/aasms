@@ -229,15 +229,16 @@ class MultiLLMVotingService:
             # exception (llm_client returns {} on unparseable output). Without this guard
             # it would silently become a valid decision=False vote — a phantom "criterion
             # not satisfied" that counts toward the majority and is invisible to any
-            # error-based check. Treat it as a failed vote instead.
-            if not isinstance(result, dict) or "decision" not in result:
+            # error-based check. Treat it as a failed vote instead. The same goes for a
+            # decision that is not a JSON boolean: bool("false") is True, and None is False.
+            if not isinstance(result, dict) or not isinstance(result.get("decision"), bool):
                 raise ValueError(
-                    f"malformed structured output, no 'decision' field: {str(result)[:200]}"
+                    f"malformed structured output, no boolean 'decision' field: {str(result)[:200]}"
                 )
 
             return VoteResult(
                 provider=provider_name,
-                decision=bool(result.get("decision", False)),
+                decision=result["decision"],
                 confidence=float(result.get("confidence", 0.5)),
                 reasoning=result.get("reasoning", ""),
                 error=None,
