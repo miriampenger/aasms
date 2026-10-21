@@ -85,3 +85,106 @@ def test_resolve_provider_small_model(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.delenv("CLAUDE_SMALL_MODEL", raising=False)
+
+
+class _FakeOpenAIClient:
+    """Stands in for AsyncOpenAI: records with_options() and responses.create() calls."""
+
+    def __init__(self):
+        self.options = {}
+        self.request = {}
+        client = self
+
+        class Responses:
+            async def create(self, **kwargs):
+                client.request.update(kwargs)
+
+                class FakeResponse:
+                    id = "resp_123"
+                    output_text = '{"ok": true}'
+
+                return FakeResponse()
+
+        self.responses = Responses()
+
+    def with_options(self, **options):
+        self.options.update(options)
+        return self
+
+
+async def _call_openai(monkeypatch, effort: str):
+    import src.services.llm_client as llm_client
+
+    fake = _FakeOpenAIClient()
+    monkeypatch.setattr(llm_client, "_get_openai_client", lambda: fake)
+    monkeypatch.setattr(llm_client.settings, "openai_reasoning_effort", effort)
+
+    result = await llm_client._generate_json_openai(
+        model_name="gpt-5.4-mini-2026-03-17",
+        prompt="screen this paper",
+        temperature=0.1,
+        max_tokens=200,
+        response_schema=None,
+    )
+    assert result == {"ok": True, "_response_id": "resp_123"}
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_openai_reasoning_effort_is_sent_when_configured(monkeypatch):
+    fake = await _call_openai(monkeypatch, effort="low")
+    assert fake.request["reasoning"] == {"effort": "low"}
+
+
+@pytest.mark.asyncio
+async def test_openai_reasoning_effort_is_left_to_the_model_by_default(monkeypatch):
+    """Defaults differ by model (gpt-5.2 uses "none", gpt-5-pro only accepts "high")."""
+    fake = await _call_openai(monkeypatch, effort="")
+    assert "reasoning" not in fake.request
+
+
+@pytest.mark.asyncio
+async def test_generate_json_calls_leave_retries_to_tenacity(monkeypatch):
+    """SDK retries inside tenacity's attempts would multiply requests (up to 36 for one
+    Anthropic call), so the generate_json calls run with max_retries=0."""
+    import src.services.llm_client as llm_client
+
+    openai_fake = await _call_openai(monkeypatch, effort="")
+    assert openai_fake.options == {"max_retries": 0}
+
+    anthropic_options = {}
+
+    class FakeAnthropicClient:
+        def with_options(self, **options):
+            anthropic_options.update(options)
+            return self
+
+        class messages:  # noqa: N801 - mirrors the SDK attribute name
+            @staticmethod
+            async def create(**kwargs):
+                class Block:
+                    text = '{"ok": true}'
+
+                class Message:
+                    content = [Block()]
+
+                return Message()
+
+    monkeypatch.setattr(llm_client, "_get_anthropic_client", lambda: FakeAnthropicClient())
+    result = await llm_client._generate_json_claude("claude-small", "prompt", 0.1, 100)
+
+    assert result == {"ok": True}
+    assert anthropic_options == {"max_retries": 0}
+
+
+def test_shared_sdk_clients_keep_their_own_retries(monkeypatch):
+    """pdf_service calls the shared clients without tenacity, so they keep SDK retries."""
+    import src.services.llm_client as llm_client
+
+    monkeypatch.setattr(llm_client.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(llm_client.settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(llm_client, "_anthropic_client", None)
+    monkeypatch.setattr(llm_client, "_openai_client", None)
+
+    assert llm_client._get_anthropic_client().max_retries == 5
+    assert llm_client._get_openai_client().max_retries > 0

@@ -34,6 +34,10 @@ _RETRYABLE_EXCEPTIONS = (
     asyncio.TimeoutError,
     ConnectionError,
 )
+# Newer anthropic SDKs raise OverloadedError for HTTP 529 instead of InternalServerError.
+# Keep it retryable after an upgrade, since the generate_json calls turn SDK retries off.
+if hasattr(anthropic, "OverloadedError"):
+    _RETRYABLE_EXCEPTIONS += (anthropic.OverloadedError,)
 
 _anthropic_client = None
 _openai_client = None
@@ -282,7 +286,10 @@ async def _generate_json_claude(
     temperature: float,
     max_tokens: int,
 ) -> dict[str, Any]:
-    client = _get_anthropic_client()
+    # Tenacity (the wrapper above) is the only retry layer here: SDK retries inside its
+    # six attempts allowed up to 36 requests for one call. The shared client keeps its
+    # SDK retries for callers without tenacity, such as the PDF metadata extraction.
+    client = _get_anthropic_client().with_options(max_retries=0)
     msg = await client.messages.create(
         model=model_name,
         messages=[{"role": "user", "content": prompt}],
@@ -306,7 +313,8 @@ async def _generate_json_openai(
     response_schema: dict[str, Any] | None,
     previous_response_id: str | None = None,
 ) -> dict[str, Any]:
-    client = _get_openai_client()
+    # As for Claude: tenacity retries this call, so no SDK retries inside it.
+    client = _get_openai_client().with_options(max_retries=0)
     json_schema = _to_json_schema(response_schema)
     kwargs = {
         "model": model_name,
@@ -333,6 +341,13 @@ async def _generate_json_openai(
     # O1 and GPT-5 models often reject custom temperature
     if not (model_name.startswith("o1-") or model_name.startswith("gpt-5")):
         kwargs["temperature"] = temperature
+
+    # Optional reasoning effort for GPT-5 and o-series models (OPENAI_REASONING_EFFORT,
+    # e.g. "low"). Unset keeps each model's own default; the accepted values differ by
+    # model (gpt-5-pro accepts only "high"), so it is opt-in.
+    effort = settings.openai_reasoning_effort.strip()
+    if effort and model_name.startswith(("gpt-5", "o1", "o3", "o4")):
+        kwargs["reasoning"] = {"effort": effort}
 
     resp = await client.responses.create(**kwargs)
 

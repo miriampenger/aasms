@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     openai_small_model: str = "gpt-5-mini-2025-08-07"
     gemini_model: str = "gemini-3-flash-preview"
     gemini_small_model: str = "gemini-3-flash-preview"
+    # Reasoning effort for GPT-5 and o-series models (e.g. "low"); empty keeps each
+    # model's default. Accepted values differ by model, so check before setting it.
+    openai_reasoning_effort: str = ""
 
     # Analysis settings
     max_tokens: int = 8000

@@ -197,6 +197,7 @@ Python service runs on **http://localhost:8000**
 | `GEMINI_MODEL` | Gemini model name | `gemini-1.5-pro-latest` |
 | `GEMINI_SMALL_MODEL` | Gemini small model name | `gemini-1.5-flash-latest` |
 | `SCREENING_BATCH_CRITERIA` | With multi-LLM voting, evaluate all criteria of a source in one call per provider instead of one call per criterion and provider (the document is sent once, not once per criterion). Off until its decisions have been compared with per-criterion screening | `false` |
+| `OPENAI_REASONING_EFFORT` | Reasoning effort for GPT-5 and o-series models, e.g. `low` for cheaper, faster calls. Empty keeps each model's default; accepted values differ by model | - |
 | `OA_CONTACT_EMAIL` | Contact email for Unpaywall and the OpenAlex polite pool. Without it, open-access PDF retrieval skips Unpaywall | - |
 | `PDF_RETRIEVAL_TIMEOUT_SECONDS` | Timeout per open-access API call and PDF download | `30` |
 | `PDF_RETRIEVAL_MAX_MB` | Largest PDF that will be downloaded | `50` |
