@@ -496,6 +496,11 @@ class PdfRetrievalService:
                 if response.status_code >= 400:
                     logger.info("PDF download %s returned %s", url, response.status_code)
                     return None
+                # Elsevier answers a paywalled article with 200 and its first page only.
+                els_status = response.headers.get("x-els-status", "")
+                if "not entitled" in els_status.lower():
+                    logger.info("PDF download %s is a preview: %s", url, els_status)
+                    return None
 
                 chunks: list[bytes] = []
                 total = 0

@@ -709,6 +709,30 @@ async def test_paywalled_elsevier_article_is_not_reported_as_open_access(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_elsevier_first_page_preview_is_not_accepted_as_the_pdf(monkeypatch):
+    """Without entitlement the API still answers 200, with a one-page PDF."""
+    configure_publishers(monkeypatch, elsevier="els-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.elsevier.com":
+            return httpx.Response(
+                200,
+                content=PDF_BYTES,
+                headers={
+                    "X-ELS-Status": "WARNING - Response limited to first page because "
+                    "requestor not entitled to resource"
+                },
+            )
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(doi="10.1016/j.trc.2023.1", title="Paper"))
+
+    assert result.found is False
+
+
+@pytest.mark.asyncio
 async def test_scopus_fills_in_a_missing_doi(monkeypatch):
     configure_publishers(monkeypatch, elsevier="els-key", contact_email="test@example.org")
     unpaywall_dois: list[str] = []
