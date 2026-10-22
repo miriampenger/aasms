@@ -347,12 +347,12 @@ export function SourceTable({
               {!isEditMode && needsPdfAction(source) && (
                 <>
                   {openAccessUrl(source) && (
-                    <IconAction label="Open the free copy - the publisher blocks automated downloads, so save it yourself">
+                    <IconAction label="Open the paper - it cannot be downloaded automatically, so save the PDF yourself">
                       <a
                         href={openAccessUrl(source)}
                         target="_blank"
                         rel="noopener noreferrer"
-                        aria-label="Open open-access copy"
+                        aria-label="Open the paper"
                       >
                         <ExternalLink className="h-3.5 w-3.5" />
                       </a>

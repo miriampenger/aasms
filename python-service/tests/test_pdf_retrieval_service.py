@@ -15,6 +15,7 @@ from src.services.pdf_retrieval_service import (
     describe_failure,
     extract_arxiv_id,
     ieee_access_is_free,
+    is_forbidden_url,
     order_candidates,
     titles_match,
 )
@@ -614,8 +615,6 @@ def configure_publishers(
     elsevier: str = "",
     inst_token: str = "",
     ieee: str = "",
-    acm_cookie: str = "",
-    acm_user_agent: str = "",
     contact_email: str = "",
 ) -> None:
     """Pin every credential the service reads, so a real .env cannot leak in."""
@@ -625,8 +624,6 @@ def configure_publishers(
         ("elsevier_api_key", elsevier),
         ("elsevier_inst_token", inst_token),
         ("ieee_api_key", ieee),
-        ("acm_dl_cookie", acm_cookie),
-        ("acm_dl_user_agent", acm_user_agent),
     ):
         monkeypatch.setattr(f"src.services.pdf_retrieval_service.settings.{name}", value)
 
@@ -1022,97 +1019,99 @@ async def test_ieee_is_skipped_for_a_foreign_doi(monkeypatch):
     assert "ieee" not in result.providers_tried
 
 
+# ACM's terms of use forbid automated access to the ACM DL; a violation costs the
+# institution its downloading rights. The service swallows transport errors, so
+# the tests record every request and check the list afterwards.
+
+ACM_DOI = "10.1145/3597503.3623301"
+
+
+def test_is_forbidden_url_covers_the_acm_dl_and_acm_doi_links():
+    assert is_forbidden_url("https://dl.acm.org/doi/pdf/10.1145/1")
+    assert is_forbidden_url("https://acm.org/")
+    assert is_forbidden_url("https://doi.org/10.1145/3597503")
+    assert is_forbidden_url("https://dx.doi.org/10.1145%2F3597503")
+    assert not is_forbidden_url("https://doi.org/10.1109/TITS.2023.1")
+    assert not is_forbidden_url("https://notacm.org/paper.pdf")
+
+
 @pytest.mark.asyncio
-async def test_acm_pdf_is_fetched_with_the_session_cookie(monkeypatch):
-    """Cloudflare binds the cookie to the browser, so its User-Agent goes along."""
-    configure_publishers(
-        monkeypatch, acm_cookie="MAID=abc; JSESSIONID=xyz", acm_user_agent="Mozilla/5.0 Safari/26"
-    )
-    seen: list[tuple[str | None, str | None]] = []
+async def test_acm_dl_is_never_requested(monkeypatch):
+    """Index links, the source URL, a DOI link, a redirect and a citation_pdf_url."""
+    configure_publishers(monkeypatch, contact_email="me@example.org")
+    seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "dl.acm.org":
-            seen.append((request.headers.get("cookie"), request.headers.get("user-agent")))
-            return httpx.Response(200, content=PDF_BYTES)
+        seen.append(str(request.url))
+        if request.url.host == "api.unpaywall.org":
+            return json_response(
+                {
+                    "best_oa_location": {"url_for_pdf": f"https://dl.acm.org/doi/pdf/{ACM_DOI}"},
+                    "oa_locations": [
+                        {"url_for_pdf": f"https://doi.org/{ACM_DOI}"},
+                        {"url_for_pdf": "https://mirror.example.org/redirect"},
+                        {"url_for_landing_page": "https://repo.example.org/landing"},
+                    ],
+                }
+            )
+        if request.url.path == "/redirect":
+            return httpx.Response(
+                302, headers={"Location": f"https://dl.acm.org/doi/pdf/{ACM_DOI}"}
+            )
+        if request.url.path == "/landing":
+            return httpx.Response(
+                200,
+                content=b'<meta name="citation_pdf_url" content="https://dl.acm.org/doi/pdf/x">',
+            )
         return httpx.Response(404)
 
     service, client = make_service(handler)
     async with client:
-        result = await service.retrieve(PdfQuery(doi="10.1145/3597503.3623301", title="Paper"))
+        result = await service.retrieve(
+            PdfQuery(doi=ACM_DOI, title="Paper", url=f"https://dl.acm.org/doi/abs/{ACM_DOI}")
+        )
 
-    assert result.found is True
-    assert result.provider == "acm"
-    assert seen == [("MAID=abc; JSESSIONID=xyz", "Mozilla/5.0 Safari/26")]
-    assert result.source_url == "https://dl.acm.org/doi/10.1145/3597503.3623301"
+    assert result.found is False
+    assert not [url for url in seen if is_forbidden_url(url)]
+    # The source's own ACM DL page is handed to the user instead.
+    assert f"https://dl.acm.org/doi/abs/{ACM_DOI}" in result.open_access_urls()
+    assert "https://mirror.example.org/redirect" in seen
+    assert "https://repo.example.org/landing" in seen
 
 
 @pytest.mark.asyncio
-async def test_acm_credentials_are_used_even_when_unpaywall_lists_the_same_url(monkeypatch):
-    """Unpaywall hands back the identical dl.acm.org URL without credentials.
+async def test_acm_paper_imported_from_scopus_gets_an_acm_dl_link(monkeypatch):
+    """Scopus stores its own record page as the URL, which is never offered."""
+    configure_publishers(monkeypatch)
+    service, client = make_service(lambda request: httpx.Response(404))
+    async with client:
+        result = await service.retrieve(
+            PdfQuery(doi=ACM_DOI, url="https://www.scopus.com/inward/record.uri?eid=2-s2.0-1")
+        )
 
-    A URL is only downloaded once, so the credentialed attempt must come first
-    or the cookie is never sent at all.
-    """
-    configure_publishers(monkeypatch, acm_cookie="JSESSIONID=xyz", contact_email="me@example.org")
-    pdf_url = "https://dl.acm.org/doi/pdf/10.1145/3597503.3623301"
-    acm_requests: list[str | None] = []
+    assert result.open_access_urls() == [f"https://dl.acm.org/doi/{ACM_DOI}"]
+    assert "ACM forbids automated downloads" in (result.reason or "")
+
+
+@pytest.mark.asyncio
+async def test_acm_paper_is_downloaded_from_a_copy_outside_the_acm_dl(monkeypatch):
+    configure_publishers(monkeypatch, contact_email="me@example.org")
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "api.unpaywall.org":
             return json_response(
-                {"best_oa_location": {"url_for_pdf": pdf_url, "host_type": "publisher"}}
+                {"best_oa_location": {"url_for_pdf": "https://repo.example.org/acm-paper.pdf"}}
             )
-        if request.url.host == "dl.acm.org":
-            acm_requests.append(request.headers.get("cookie"))
-            if request.headers.get("cookie"):
-                return httpx.Response(200, content=PDF_BYTES)
-            return httpx.Response(403, content=b"<html>challenge</html>")
-        return httpx.Response(404)
-
-    service, client = make_service(handler)
-    async with client:
-        result = await service.retrieve(PdfQuery(doi="10.1145/3597503.3623301"))
-
-    assert result.found is True
-    assert result.provider == "acm"
-    assert acm_requests == ["JSESSIONID=xyz"]
-
-
-@pytest.mark.asyncio
-async def test_acm_is_tried_without_a_cookie(monkeypatch):
-    """Since ACM Open much of the DL is free, so the attempt is worth making."""
-    configure_publishers(monkeypatch)
-    urls: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        urls.append(str(request.url))
-        if request.url.host == "dl.acm.org":
-            assert "cookie" not in request.headers
+        if str(request.url) == "https://repo.example.org/acm-paper.pdf":
             return httpx.Response(200, content=PDF_BYTES)
         return httpx.Response(404)
 
     service, client = make_service(handler)
     async with client:
-        result = await service.retrieve(PdfQuery(doi="10.1145/3597503.3623301"))
+        result = await service.retrieve(PdfQuery(doi=ACM_DOI, title="Paper"))
 
     assert result.found is True
-    assert "https://dl.acm.org/doi/pdf/10.1145/3597503.3623301" in urls
-
-
-@pytest.mark.asyncio
-async def test_acm_is_skipped_for_a_foreign_doi(monkeypatch):
-    configure_publishers(monkeypatch)
-    hosts: list[str | None] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        hosts.append(request.url.host)
-        return httpx.Response(404)
-
-    service, client = make_service(handler)
-    async with client:
-        await service.retrieve(PdfQuery(doi="10.1109/TITS.2023.7", title="Paper"))
-
-    assert "dl.acm.org" not in hosts
+    assert result.provider == "unpaywall"
 
 
 @pytest.mark.asyncio
@@ -1141,6 +1140,6 @@ def test_belongs_to_publisher_matches_on_the_source_url():
 
 
 def test_describe_failure_names_the_providers_that_were_asked():
-    reason = describe_failure([], ["unpaywall", "ieee", "acm", "landing-page"])
+    reason = describe_failure([], ["unpaywall", "ieee", "landing-page"])
 
-    assert reason == "No downloadable copy found (checked Unpaywall, IEEE Xplore, ACM DL)"
+    assert reason == "No downloadable copy found (checked Unpaywall, IEEE Xplore)"

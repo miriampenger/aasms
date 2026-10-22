@@ -6,13 +6,12 @@ order and downloading the first candidate that really serves a PDF:
 
 1. arXiv, when an arXiv id is already visible in the DOI or the source URL
 2. ScienceDirect, for Elsevier DOIs (requires ``elsevier_api_key``)
-3. the ACM DL, for ACM DOIs (``acm_dl_cookie`` adds subscriber access)
-4. Unpaywall (requires ``oa_contact_email``)
-5. OpenAlex
-6. Semantic Scholar
-7. arXiv title search
-8. IEEE Xplore, for IEEE DOIs (requires ``ieee_api_key``)
-9. the publisher landing page (``citation_pdf_url`` meta tag)
+3. Unpaywall (requires ``oa_contact_email``)
+4. OpenAlex
+5. Semantic Scholar
+6. arXiv title search
+7. IEEE Xplore, for IEEE DOIs (requires ``ieee_api_key``)
+8. the publisher landing page (``citation_pdf_url`` meta tag)
 
 The publisher steps are skipped unless their credential is configured, and each
 only runs for records that belong to that publisher, so the Scopus/ScienceDirect
@@ -23,6 +22,7 @@ later provider.
 Nothing here bypasses a paywall or a publisher login: the publisher APIs are
 called with the credentials you supply, and Elsevier serves full text only
 for its open-access articles unless an institutional token is configured.
+The ACM DL is never contacted at all (see ``is_forbidden_url``).
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ import logging
 import re
 from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
 from aiolimiter import AsyncLimiter
@@ -53,7 +53,6 @@ _LIMITER_RATES: dict[str, tuple[float, float]] = {
     "arxiv": (1, 3),
     "elsevier": (2, 1),
     "ieee": (2, 1),
-    "acm": (1, 2),
     "download": (4, 1),
 }
 _limiters: dict[tuple[str, int], AsyncLimiter] = {}
@@ -107,6 +106,11 @@ ELSEVIER_DOI_PREFIXES = ("10.1016", "10.1006", "10.1053", "10.1067", "10.1078", 
 ELSEVIER_HOSTS = ("sciencedirect.com", "elsevier.com")
 IEEE_DOI_PREFIXES = ("10.1109", "10.23919")
 IEEE_HOSTS = ("ieee.org",)
+
+# The ACM DL's terms of use forbid "scripts, spiders or other robotic activity
+# to automatically download articles or harvest metadata", on pain of the
+# institution losing its downloading rights. No request may reach it, not even
+# through a DOI link, which redirects there.
 ACM_DOI_PREFIXES = ("10.1145",)
 ACM_HOSTS = ("acm.org",)
 
@@ -129,7 +133,6 @@ PROVIDER_LABELS = {
     "scopus": "Scopus",
     "elsevier": "Elsevier",
     "ieee": "IEEE Xplore",
-    "acm": "ACM DL",
 }
 
 
@@ -237,6 +240,24 @@ def is_index_host(url: str) -> bool:
     return any(host == blocked or host.endswith(f".{blocked}") for blocked in INDEX_HOSTS)
 
 
+def is_forbidden_url(url: str) -> bool:
+    """True for the ACM DL, and for DOI links that redirect to it."""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if any(host == h or host.endswith(f".{h}") for h in ACM_HOSTS):
+        return True
+    if host == "doi.org" or host.endswith(".doi.org"):
+        doi = unquote(parsed.path).lstrip("/").lower()
+        return doi.startswith(tuple(f"{prefix}/" for prefix in ACM_DOI_PREFIXES))
+    return False
+
+
+async def _refuse_forbidden_request(request: httpx.Request) -> None:
+    """httpx request hook; it runs before every request, redirect hops included."""
+    if is_forbidden_url(str(request.url)):
+        raise httpx.RequestError(f"Not requesting {request.url}: ACM forbids automated access")
+
+
 def ieee_access_is_free(access_type: str | None) -> tuple[bool, str | None]:
     """Whether an IEEE ``access_type`` means anyone may read the paper.
 
@@ -278,6 +299,12 @@ def describe_failure(
                 checked.append(label)
         listed = ", ".join(checked) or "Unpaywall, OpenAlex, Semantic Scholar, arXiv"
         return f"No downloadable copy found (checked {listed})"
+
+    if all(is_forbidden_url(c.link) for c in open_access):
+        return (
+            "No copy outside the ACM DL found, and ACM forbids automated downloads. "
+            "Open the ACM DL link, download the PDF yourself and upload it"
+        )
 
     hosts = sorted({urlparse(c.link).hostname or "?" for c in open_access})
     return (
@@ -325,13 +352,13 @@ class PdfRetrievalService:
 
     def __init__(self, client: httpx.AsyncClient):
         self.client = client
+        hooks = client.event_hooks
+        client.event_hooks = {**hooks, "request": [*hooks["request"], _refuse_forbidden_request]}
         self.contact_email = (settings.oa_contact_email or "").strip()
         self.semantic_scholar_api_key = (settings.semantic_scholar_api_key or "").strip()
         self.elsevier_api_key = (settings.elsevier_api_key or "").strip()
         self.elsevier_inst_token = (settings.elsevier_inst_token or "").strip()
         self.ieee_api_key = (settings.ieee_api_key or "").strip()
-        self.acm_dl_cookie = (settings.acm_dl_cookie or "").strip()
-        self.acm_dl_user_agent = (settings.acm_dl_user_agent or "").strip()
         self.max_bytes = settings.pdf_retrieval_max_mb * 1024 * 1024
 
     # ---------------------------------------------------------------- public
@@ -365,6 +392,10 @@ class PdfRetrievalService:
                 if candidate.url in seen or is_index_host(candidate.url):
                     continue
                 seen.add(candidate.url)
+                if is_forbidden_url(candidate.url):
+                    # Never fetched; offered as a link for manual download instead.
+                    all_candidates.append(replace(candidate, is_open_access=True))
+                    continue
                 all_candidates.append(candidate)
 
                 downloaded = await self.download_pdf(candidate.url, candidate.headers)
@@ -380,6 +411,13 @@ class PdfRetrievalService:
                         providers_tried=providers_tried,
                         candidates=all_candidates,
                     )
+
+        # Scopus imports carry a Scopus record URL, so build the ACM page from the DOI.
+        doi = query.clean_doi
+        if doi and doi.startswith(tuple(f"{prefix}/" for prefix in ACM_DOI_PREFIXES)):
+            all_candidates.append(
+                PdfCandidate(url=f"https://dl.acm.org/doi/{doi}", provider="acm", kind="landing")
+            )
 
         return PdfRetrievalResult(
             found=False,
@@ -397,11 +435,6 @@ class PdfRetrievalService:
         resolvers = [("arxiv-id", self._from_arxiv_id)]
         if self.elsevier_api_key:
             resolvers.append(("elsevier", self._from_elsevier))
-        # The ACM DL needs no key: since ACM Open, much of it is free, and the
-        # cookie only adds the subscriber-only remainder. It has to run before
-        # the open-access indexes: they list the very same dl.acm.org URL
-        # without credentials, and a URL is only ever downloaded once.
-        resolvers.append(("acm", self._from_acm))
         resolvers += [
             ("unpaywall", self._from_unpaywall),
             ("openalex", self._from_openalex),
@@ -829,41 +862,6 @@ class PdfRetrievalService:
                 )
             )
         return candidates
-
-    async def _from_acm(self, query: PdfQuery) -> list[PdfCandidate] | None:
-        """Try the ACM DL's direct PDF route for ACM DOIs.
-
-        The ACM has no public API, so the only handle is the well-known
-        ``dl.acm.org/doi/pdf/<doi>`` URL. Since ACM Open a large part of the
-        library is free; ``acm_dl_cookie`` (the Cookie header of a signed-in
-        session) adds whatever your institution subscribes to on top.
-
-        The site sits behind Cloudflare, which binds that cookie to the IP
-        address and the User-Agent it was issued to. The cookie therefore only
-        works from the network it was captured on, and ``acm_dl_user_agent``
-        must carry the browser's exact User-Agent string.
-        """
-        doi = query.clean_doi
-        if not doi or not belongs_to_publisher(query, ACM_DOI_PREFIXES, ACM_HOSTS):
-            return None
-
-        headers: dict[str, str] = {}
-        if self.acm_dl_cookie:
-            headers["Cookie"] = self.acm_dl_cookie
-            if self.acm_dl_user_agent:
-                headers["User-Agent"] = self.acm_dl_user_agent
-        return [
-            PdfCandidate(
-                url=f"https://dl.acm.org/doi/pdf/{doi}",
-                provider="acm",
-                kind="pdf",
-                # Whether this particular article is free is unknown until the
-                # download either works or is refused.
-                is_open_access=False,
-                headers=headers,
-                public_url=f"https://dl.acm.org/doi/{doi}",
-            )
-        ]
 
     async def _with_looked_up_doi(self, query: PdfQuery) -> tuple[PdfQuery, list[str]]:
         """Fill in a missing DOI from Scopus so every later provider can use it.

@@ -60,13 +60,6 @@ class Settings(BaseSettings):
     elsevier_inst_token: str = ""
     # IEEE Xplore metadata API key from developer.ieee.org.
     ieee_api_key: str = ""
-    # The ACM DL has no public API. Paste the Cookie header of a logged-in
-    # dl.acm.org session to fetch articles your institution subscribes to;
-    # without it only ACM Open (free) articles can be downloaded.
-    acm_dl_cookie: str = ""
-    # Cloudflare ties that cookie to the browser it was issued to, so send the
-    # same User-Agent string (copy it from the same request as the cookie).
-    acm_dl_user_agent: str = ""
 
     # E2E test mode — uses FakeProvider instead of real LLM APIs
     e2e_test_mode: bool = False
